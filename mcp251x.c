@@ -262,14 +262,14 @@ MODULE_PARM_DESC(rxbn_op_mode, "0 = (default) MCP2515 hardware filtering will"
 	" rxb0 controls filters 0 and 1, rxb1 controls filters 2-5"
 	" Note there is kernel level filtering, but for high traffic scenarios"
 	" kernel may not be able to keep up."
-	" 1 = use rxbn_mask and rxbn filters, but only accept std CAN ids."
-	" 2 = use rxbn_mask and rxbn filters, but only accept ext CAN ids."
+	" 1 = DO NOT USE, Setting the RXM[1:0] bits to ‘01’ or ‘10’ is not recommended."
+	" 2 = DO NOT USE, Setting the RXM[1:0] bits to ‘01’ or ‘10’ is not recommended"
 	" 3 = use rxbn_mask and rxbn filters, and accept ext or std CAN ids.");
 
 static int rxbn_mask[2];
 module_param_array(rxbn_mask, int, NULL, S_IRUGO);
 MODULE_PARM_DESC(rxbn_mask, "Mask used for receive buffer n if rxbn_op_mode "
-	" is 1, 2 or 3. Bits 10-0 for std ids. Bits 29-11 for ext ids.");
+	" is 3. Bits 28-18 for std ids. Bits 17-0 for ext ids.");
 
 static int rxbn_filters[6];
 module_param_array(rxbn_filters, int, NULL, S_IRUGO);
@@ -278,6 +278,15 @@ MODULE_PARM_DESC(rxbn_filters, "Filter used for receive buffer n if "
 	"ids (also need to set bit 30 for ext id filtering). Note that filters "
 	"0 and 1 correspond to rxbn_op_mode[0] and rxbn_mask[0], while filters "
 	"2-5 corresponds to rxbn_op_mode[1] and rxbn_mask[1]");
+
+static bool rxbn_exide[2];
+module_param_array(rxbn_exide, bool, NULL, S_IRUGO);
+MODULE_PARM_DESC(rxbn_exide, "Extended Identifier Enable bit used for receive buffer n (0 or 1)."
+	"The RXM[1:0] bits (RXBnCTRL[6:5]) set special Receive modes. "
+	"These bits are cleared to ‘00’ to enable acceptance filters. In this case, the "
+	"determination of whether or not to receive standard or extended messages "
+	"is determined by the EXIDE bit (RFXnSIDL[3])."
+	"0 = disable EXIDE (default), 1 = enable EXIDE to filter extended IDs");
 
 static const struct can_bittiming_const mcp251x_bittiming_const = {
 	.name = DEVICE_NAME,
@@ -671,58 +680,66 @@ static int mcp251x_do_set_bittiming(struct net_device *net)
 static int mcp251x_setup(struct net_device *net, struct spi_device *spi)
 {
 	int i = 0;
+	bool j = 0;
 	uint8_t reg_val = 0;
 
 	mcp251x_do_set_bittiming(net);
 
 	/* Setup recv buffer 0 control. default no hw filtering */
 	reg_val = RXBCTRL_BUKT | RXBCTRL_RXM1 | RXBCTRL_RXM0;
-	if (1 == rxbn_op_mode[0]) {
-		/* std ids only */
-		reg_val = RXBCTRL_BUKT | RXBCTRL_RXM0 ;
-	} else if (2 == rxbn_op_mode[0]) {
-		/* ext ids only */
-		reg_val = RXBCTRL_BUKT | RXBCTRL_RXM1;
-	} else if (3 == rxbn_op_mode[0]) {	
+	if (0 != rxbn_op_mode[0]) {
 		/* std or ext ids */
 		reg_val = RXBCTRL_BUKT;
-	}	
+	}
 	mcp251x_write_reg(spi, RXBCTRL(0), reg_val);
 
 	/* Setup recv buffer 1 control. default no hw filtering */
 	reg_val = RXBCTRL_RXM1 | RXBCTRL_RXM0;
-	if (1 == rxbn_op_mode[1]) {
-		/* std ids only */
-		reg_val = RXBCTRL_RXM0 ;
-	} else if (2 == rxbn_op_mode[1]) {
-		/* ext ids only */
-		reg_val = RXBCTRL_RXM1;
-	} else if (3 == rxbn_op_mode[1]) {	
+	if (0 != rxbn_op_mode[1]) {
 		/* std or ext ids */
 		reg_val = 0;
-	}	
+	}
 	mcp251x_write_reg(spi, RXBCTRL(1), reg_val);
 
 	/* Fill out mask registers */
 	for (i = 0; i < ARRAY_SIZE(rxbn_mask); i++) {
-		mcp251x_write_reg(spi, RXMSIDH(i), (uint8_t)(rxbn_mask[i]>>3));
-		mcp251x_write_reg(spi, RXMSIDL(i), (uint8_t)((rxbn_mask[i]<<5) | 
-			(0x3 & (rxbn_mask[i]>>27))));
-		mcp251x_write_reg(spi, RXMEID8(i), (uint8_t)(rxbn_mask[i]>>19));
-		mcp251x_write_reg(spi, RXMEID0(i), (uint8_t)(rxbn_mask[i]>>11));
+		if (rxbn_exide[i] == 0) { /* CAN_ID: 11 bit */
+			mcp251x_write_reg(spi, RXMSIDH(i), (uint8_t)(rxbn_mask[i]>>3));
+			mcp251x_write_reg(spi, RXMSIDL(i), (uint8_t)((rxbn_mask[i]<<5) |
+				(0x3 & (rxbn_mask[i]>>27))));
+			mcp251x_write_reg(spi, RXMEID8(i), (uint8_t)(rxbn_mask[i]>>19));
+			mcp251x_write_reg(spi, RXMEID0(i), (uint8_t)(rxbn_mask[i]>>11));
+		}
+		else {  /* CAN_ID: 29 bit */
+			mcp251x_write_reg(spi, RXMSIDH(i), (uint8_t)(rxbn_mask[i]>>21));
+			mcp251x_write_reg(spi, RXMSIDL(i), (uint8_t)((0xe0 & (rxbn_mask[i]>>13)) |
+				(0x3 & (rxbn_mask[i]>>16))));
+			mcp251x_write_reg(spi, RXMEID8(i), (uint8_t)(rxbn_mask[i]>>8));
+			mcp251x_write_reg(spi, RXMEID0(i), (uint8_t)(rxbn_mask[i]));
+		}
 	}
 
 	/* Fill out filter registers */
 	for (i = 0; i < ARRAY_SIZE(rxbn_filters); i++) {
-		mcp251x_write_reg(spi, RXFSIDH[i], (uint8_t)(
-			rxbn_filters[i]>>3));
-		mcp251x_write_reg(spi, RXFSIDL[i], (uint8_t)(
-			(rxbn_filters[i]<<5) | (0x3 & (rxbn_filters[i]>>27)) | 
-			(0x8 & (rxbn_filters[i]>>29))));
-		mcp251x_write_reg(spi, RXFEID8[i], (uint8_t)(
-			rxbn_filters[i]>>19));
-		mcp251x_write_reg(spi, RXFEID0[i], (uint8_t)(
-			rxbn_filters[i]>>11));
+		j = i < 2 ? rxbn_exide[0] : rxbn_exide[1];
+		if (j == 0) { /* CAN_ID: 11 bit */
+			mcp251x_write_reg(spi, RXFSIDH[i], (uint8_t)(
+				rxbn_filters[i]>>3));
+			mcp251x_write_reg(spi, RXFSIDL[i], (uint8_t)(
+				(rxbn_filters[i]<<5) | (0x3 & (rxbn_filters[i]>>27)) |
+				(0x8 & (rxbn_filters[i]>>29))));
+			mcp251x_write_reg(spi, RXFEID8[i], (uint8_t)(
+				rxbn_filters[i]>>19));
+			mcp251x_write_reg(spi, RXFEID0[i], (uint8_t)(
+				rxbn_filters[i]>>11));
+		}
+		else {  /* CAN_ID: 29 bit */
+			mcp251x_write_reg(spi, RXFSIDH[i], (uint8_t)(rxbn_filters[i]>>21));
+			mcp251x_write_reg(spi, RXFSIDL[i], (uint8_t)(
+				(0xe0 & (rxbn_filters[i]>>13)) | (0x3 & (rxbn_filters[i]>>16)) | 0x8));
+			mcp251x_write_reg(spi, RXFEID8[i], (uint8_t)(rxbn_filters[i]>>8));
+			mcp251x_write_reg(spi, RXFEID0[i], (uint8_t)(rxbn_filters[i]));
+		}
 	}
 
 	return 0;
